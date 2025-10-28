@@ -1,3 +1,6 @@
+mod cli;
+mod daemon;
+
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
@@ -8,16 +11,21 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use clap::Parser;
 use intaglio::Symbol;
 use intaglio::osstr::SymbolTable;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::debug;
+use tracing_subscriber::FmtSubscriber;
 
 use zerofs_nfsserve::fs_util::*;
 use zerofs_nfsserve::nfs::*;
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+
+use cli::Cli;
+use daemon::{change_working_directory, handle_daemon_mode};
 
 #[derive(Debug, Clone)]
 struct FSEntry {
@@ -28,12 +36,18 @@ struct FSEntry {
     children: Option<BTreeSet<fileid3>>,
 }
 
+/// File system mapping structure
 #[derive(Debug)]
 struct FSMap {
+    /// Root directory path
     root: PathBuf,
+    /// Next file ID counter
     next_fileid: AtomicU64,
+    /// Symbol table for interned strings
     intern: SymbolTable,
+    /// Mapping from file ID to file system entry
     id_to_path: HashMap<fileid3, FSEntry>,
+    /// Mapping from path symbols to file ID
     path_to_id: HashMap<Vec<Symbol>, fileid3>,
 }
 
@@ -232,9 +246,13 @@ impl FSMap {
         next_id
     }
 }
+/// Mirror file system implementation
 #[derive(Debug)]
 pub struct MirrorFS {
+    /// File system mapping protected by mutex
     fsmap: tokio::sync::Mutex<FSMap>,
+    /// Read-only mode flag
+    read_only: bool,
 }
 
 /// Enumeration for the create_fs_object method
@@ -249,9 +267,11 @@ enum CreateFSObject {
     Symlink((sattr3, nfspath3)),
 }
 impl MirrorFS {
-    pub fn new(root: PathBuf) -> MirrorFS {
+    /// Create a new mirror file system
+    pub fn new(root: PathBuf, read_only: bool) -> MirrorFS {
         MirrorFS {
             fsmap: tokio::sync::Mutex::new(FSMap::new(root)),
+            read_only,
         }
     }
 
@@ -331,7 +351,11 @@ impl NFSFileSystem for MirrorFS {
         0
     }
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
+        if self.read_only {
+            VFSCapabilities::ReadOnly
+        } else {
+            VFSCapabilities::ReadWrite
+        }
     }
 
     async fn lookup(
@@ -792,25 +816,45 @@ impl NFSFileSystem for MirrorFS {
     }
 }
 
-const HOSTPORT: u32 = 11111;
-
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::ERROR)
-        .with_writer(std::io::stderr)
-        .init();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse command line arguments
+    let cli = Cli::parse();
 
-    let path = std::env::args()
-        .nth(1)
-        .expect("must supply directory to mirror");
-    let path = PathBuf::from(path);
+    // Validate configuration
+    cli.validate()?;
 
-    let fs = MirrorFS::new(path);
-    let listener = NFSTcpListener::bind(format!("127.0.0.1:{HOSTPORT}").parse().unwrap(), fs)
-        .await
-        .unwrap();
-    listener.handle_forever().await.unwrap();
+    // Initialize logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(cli.get_log_level())
+        .with_ansi(!cli.no_color)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    // Handle daemon mode
+    if cli.daemon {
+        handle_daemon_mode(&cli)?;
+    }
+
+    // Change working directory if specified
+    change_working_directory(&cli.work_dir)?;
+
+    // Parse allowed IP addresses
+    let allowed_ips = cli.parse_allowed_ips();
+
+    // Print startup information
+    cli.print_startup_info(&allowed_ips);
+
+    // Create NFS file system
+    let root_dir = cli.directory.canonicalize()?;
+    let fs = MirrorFS::new(root_dir, cli.read_only);
+
+    // Start NFS TCP server
+    let addr = format!("{}:{}", cli.ip, cli.port).parse()?;
+    let listener = NFSTcpListener::bind(addr, fs).await?;
+
+    // Start the server
+    listener.handle_forever().await?;
+
+    Ok(())
 }
-// Test with
-// mount -t nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000,soft 127.0.0.1:/ mnt/

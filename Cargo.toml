@@ -1,6 +1,6 @@
 [package]
 name = "nfs_mirror"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license-file = "LICENSE"
 description = "Mirror a local directory into an NFS shared service."
@@ -14,3 +14,5 @@ tokio = { version = "1.48.0", features = ["net", "io-util", "sync", "fs", "rt", 
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 intaglio = "1.11.0"
+clap = { version = "4.5.0", features = ["derive"] }
+libc = "0.2.0"
