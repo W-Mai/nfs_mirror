@@ -1,10 +1,12 @@
 mod cli;
 mod daemon;
+mod config;
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::io::SeekFrom;
+use std::net::IpAddr;
 use std::ops::Bound;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -26,6 +28,7 @@ use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, 
 
 use cli::Cli;
 use daemon::{change_working_directory, handle_daemon_mode};
+use config::Config;
 
 #[derive(Debug, Clone)]
 struct FSEntry {
@@ -39,8 +42,8 @@ struct FSEntry {
 /// File system mapping structure
 #[derive(Debug)]
 struct FSMap {
-    /// Root directory path
-    root: PathBuf,
+    /// Mount configurations
+    mounts: Vec<(String, PathBuf, bool)>, // (target_path, source_path, read_only)
     /// Next file ID counter
     next_fileid: AtomicU64,
     /// Symbol table for interned strings
@@ -62,24 +65,135 @@ enum RefreshResult {
 }
 
 impl FSMap {
-    fn new(root: PathBuf) -> FSMap {
-        // create root entry
-        let root_entry = FSEntry {
-            name: Vec::new(),
-            fsmeta: metadata_to_fattr3(1, &root.metadata().unwrap()),
-            children_meta: metadata_to_fattr3(1, &root.metadata().unwrap()),
-            children: None,
-        };
-        FSMap {
-            root,
+    /// Create a new FSMap with root directory only
+    fn new_with_root(root_dir: PathBuf) -> FSMap {
+        let mut fsmap = FSMap {
+            mounts: Vec::new(),
             next_fileid: AtomicU64::new(1),
             intern: SymbolTable::new(),
-            id_to_path: HashMap::from([(0, root_entry)]),
-            path_to_id: HashMap::from([(Vec::new(), 0)]),
-        }
+            id_to_path: HashMap::new(),
+            path_to_id: HashMap::new(),
+        };
+
+        // Create root entry with actual root directory metadata
+        let root_metadata = root_dir.metadata().unwrap_or_else(|_| {
+            // Create default metadata if root doesn't exist
+            std::fs::metadata(".").unwrap()
+        });
+
+        let root_entry = FSEntry {
+            name: Vec::new(),
+            fsmeta: metadata_to_fattr3(0, &root_metadata),
+            children_meta: metadata_to_fattr3(0, &root_metadata),
+            children: Some(BTreeSet::new()),
+        };
+
+        fsmap.id_to_path.insert(0, root_entry);
+        fsmap.path_to_id.insert(Vec::new(), 0);
+
+        fsmap
     }
+
+    /// Create a new FSMap with mount points
+    fn new_with_mounts(root_dir: PathBuf, mounts: Vec<(String, PathBuf, bool)>) -> FSMap {
+        let mut fsmap = FSMap {
+            mounts,
+            next_fileid: AtomicU64::new(1),
+            intern: SymbolTable::new(),
+            id_to_path: HashMap::new(),
+            path_to_id: HashMap::new(),
+        };
+
+        // Create root entry with actual root directory metadata
+        let root_metadata = root_dir.metadata().unwrap_or_else(|_| {
+            // Create default metadata if root doesn't exist
+            std::fs::metadata(".").unwrap()
+        });
+
+        let root_entry = FSEntry {
+            name: Vec::new(),
+            fsmeta: metadata_to_fattr3(0, &root_metadata),
+            children_meta: metadata_to_fattr3(0, &root_metadata),
+            children: Some(BTreeSet::new()),
+        };
+
+        fsmap.id_to_path.insert(0, root_entry);
+        fsmap.path_to_id.insert(Vec::new(), 0);
+
+        // Initialize mount points as root children
+        for (target_path, source_path, _read_only) in &fsmap.mounts {
+            let target_sym = fsmap
+                .intern
+                .intern(OsStr::new(target_path.trim_start_matches('/')).to_os_string())
+                .unwrap();
+
+            let mount_entry = FSEntry {
+                name: vec![target_sym],
+                fsmeta: metadata_to_fattr3(1, &source_path.metadata().unwrap_or_else(|_| {
+                    // Create default metadata if source doesn't exist
+                    std::fs::metadata(".").unwrap()
+                })),
+                children_meta: metadata_to_fattr3(1, &source_path.metadata().unwrap_or_else(|_| {
+                    std::fs::metadata(".").unwrap()
+                })),
+                children: None,
+            };
+
+            let fileid = fsmap.next_fileid.fetch_add(1, Ordering::SeqCst) as fileid3;
+            fsmap.id_to_path.insert(fileid, mount_entry);
+            fsmap.path_to_id.insert(vec![target_sym], fileid);
+
+            // Add to root children
+            if let Some(root_entry) = fsmap.id_to_path.get_mut(&0) {
+                if let Some(ref mut children) = root_entry.children {
+                    children.insert(fileid);
+                }
+            }
+        }
+
+        fsmap
+    }
+
+    fn new(mounts: Vec<(String, PathBuf, bool)>) -> FSMap {
+        // For backward compatibility, use current directory as root
+        Self::new_with_mounts(PathBuf::from("."), mounts)
+    }
+
+    /// Get the actual file system path for a given symbolic path
+    async fn sym_to_real_path(&self, symlist: &[Symbol]) -> Option<(PathBuf, bool)> {
+        if symlist.is_empty() {
+            return None; // Root path doesn't map to a real file
+        }
+
+        // Check if this is a mount point
+        if symlist.len() == 1 {
+            let mount_name = self.intern.get(symlist[0])?;
+            for (target_path, source_path, _read_only) in &self.mounts {
+                if mount_name == OsStr::new(target_path.trim_start_matches('/')) {
+                    return Some((source_path.clone(), *_read_only));
+                }
+            }
+        }
+
+        // Check if this is under a mount point
+        if symlist.len() >= 1 {
+            let mount_name = self.intern.get(symlist[0])?;
+            for (target_path, source_path, _read_only) in &self.mounts {
+                if mount_name == OsStr::new(target_path.trim_start_matches('/')) {
+                    let mut real_path = source_path.clone();
+                    for sym in &symlist[1..] {
+                        real_path.push(self.intern.get(*sym)?);
+                    }
+                    return Some((real_path, *_read_only));
+                }
+            }
+        }
+
+        None
+    }
+
     async fn sym_to_path(&self, symlist: &[Symbol]) -> PathBuf {
-        let mut ret = self.root.clone();
+        let mut ret = PathBuf::new();
         for i in symlist.iter() {
             ret.push(self.intern.get(*i).unwrap());
         }
@@ -145,15 +259,52 @@ impl FSMap {
             .get(&id)
             .ok_or(nfsstat3::NFS3ERR_NOENT)?
             .clone();
-        let path = self.sym_to_path(&entry.name).await;
-        //
-        if !exists_no_traverse(&path) {
+
+        // Get the real file system path
+        let (real_path, _read_only) = match self.sym_to_real_path(&entry.name).await {
+            Some(path) => path,
+            None => {
+                // Root entry or mount point, handle differently
+                if entry.name.is_empty() {
+                    // Root entry - always exists
+                    return Ok(RefreshResult::Noop);
+                } else {
+                    // Mount point - check if source exists
+                    let mounts = self.mounts.clone();
+                    for (target_path, source_path, _) in &mounts {
+                        if entry.name.len() == 1 {
+                            let mount_name = self.intern.get(entry.name[0]).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+                            if mount_name == OsStr::new(target_path.trim_start_matches('/')) {
+                                if !source_path.exists() {
+                                    self.delete_entry(id);
+                                    debug!("Deleting mount point {:?}: {:?}. Ent: {:?}", id, source_path, entry);
+                                    return Ok(RefreshResult::Delete);
+                                }
+                                let meta = tokio::fs::symlink_metadata(source_path)
+                                    .await
+                                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                                let meta = metadata_to_fattr3(id, &meta);
+                                if fattr3_differ(&meta, &entry.fsmeta) {
+                                    self.id_to_path.get_mut(&id).unwrap().fsmeta = meta;
+                                    debug!("Reloading mount point {:?}: {:?}. Ent: {:?}", id, source_path, entry);
+                                    return Ok(RefreshResult::Reload);
+                                }
+                                return Ok(RefreshResult::Noop);
+                            }
+                        }
+                    }
+                    return Ok(RefreshResult::Noop);
+                }
+            }
+        };
+
+        if !exists_no_traverse(&real_path) {
             self.delete_entry(id);
-            debug!("Deleting entry A {:?}: {:?}. Ent: {:?}", id, path, entry);
+            debug!("Deleting entry A {:?}: {:?}. Ent: {:?}", id, real_path, entry);
             return Ok(RefreshResult::Delete);
         }
 
-        let meta = tokio::fs::symlink_metadata(&path)
+        let meta = tokio::fs::symlink_metadata(&real_path)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let meta = metadata_to_fattr3(id, &meta);
@@ -174,13 +325,13 @@ impl FSMap {
                 id, entry.fsmeta, meta
             );
             self.delete_entry(id);
-            debug!("Deleting entry B {:?}: {:?}. Ent: {:?}", id, path, entry);
+            debug!("Deleting entry B {:?}: {:?}. Ent: {:?}", id, real_path, entry);
             return Ok(RefreshResult::Delete);
         }
         // inplace modification.
         // update metadata
         self.id_to_path.get_mut(&id).unwrap().fsmeta = meta;
-        debug!("Reloading entry {:?}: {:?}. Ent: {:?}", id, path, entry);
+        debug!("Reloading entry {:?}: {:?}. Ent: {:?}", id, real_path, entry);
         Ok(RefreshResult::Reload)
     }
     async fn refresh_dir_list(&mut self, id: fileid3) -> Result<(), nfsstat3> {
@@ -196,28 +347,55 @@ impl FSMap {
         if !matches!(entry.fsmeta.ftype, ftype3::NF3DIR) {
             return Ok(());
         }
+
         let mut cur_path = entry.name.clone();
-        let path = self.sym_to_path(&entry.name).await;
         let mut new_children: Vec<u64> = Vec::new();
-        debug!("Relisting entry {:?}: {:?}. Ent: {:?}", id, path, entry);
-        if let Ok(mut listing) = tokio::fs::read_dir(&path).await {
-            while let Some(entry) = listing
-                .next_entry()
-                .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            {
-                let sym = self.intern.intern(entry.file_name()).unwrap();
-                cur_path.push(sym);
-                let meta = entry.metadata().await.unwrap();
-                let next_id = self.create_entry(&cur_path, meta).await;
-                new_children.push(next_id);
+        debug!("Relisting entry {:?}: {:?}. Ent: {:?}", id, cur_path, entry);
+
+        // Handle root directory differently - list mount points
+        if entry.name.is_empty() {
+            // Root directory - list mount points
+            let mounts = self.mounts.clone();
+            for (target_path, source_path, _read_only) in &mounts {
+                let target_sym = self.intern.intern(OsStr::new(target_path.trim_start_matches('/')).to_os_string()).unwrap();
+                cur_path.push(target_sym);
+
+                if source_path.exists() {
+                    let meta = tokio::fs::symlink_metadata(source_path)
+                        .await
+                        .unwrap_or_else(|_| std::fs::metadata(".").unwrap());
+                    let next_id = self.create_entry(&cur_path, meta).await;
+                    new_children.push(next_id);
+                }
                 cur_path.pop();
             }
-            self.id_to_path
-                .get_mut(&id)
-                .ok_or(nfsstat3::NFS3ERR_NOENT)?
-                .children = Some(BTreeSet::from_iter(new_children.into_iter()));
+        } else {
+            // Regular directory - get real path and list contents
+            let (real_path, _read_only) = match self.sym_to_real_path(&entry.name).await {
+                Some(path) => path,
+                None => return Ok(()), // Mount point without real path
+            };
+
+            if let Ok(mut listing) = tokio::fs::read_dir(&real_path).await {
+                while let Some(entry) = listing
+                    .next_entry()
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                {
+                    let sym = self.intern.intern(entry.file_name()).unwrap();
+                    cur_path.push(sym);
+                    let meta = entry.metadata().await.unwrap();
+                    let next_id = self.create_entry(&cur_path, meta).await;
+                    new_children.push(next_id);
+                    cur_path.pop();
+                }
+            }
         }
+
+        self.id_to_path
+            .get_mut(&id)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?
+            .children = Some(BTreeSet::from_iter(new_children.into_iter()));
 
         Ok(())
     }
@@ -267,25 +445,56 @@ enum CreateFSObject {
     Symlink((sattr3, nfspath3)),
 }
 impl MirrorFS {
-    /// Create a new mirror file system
-    pub fn new(root: PathBuf, read_only: bool) -> MirrorFS {
+    /// Create a new mirror file system with root directory only
+    pub fn new(root_dir: PathBuf, read_only: bool) -> MirrorFS {
         MirrorFS {
-            fsmap: tokio::sync::Mutex::new(FSMap::new(root)),
+            fsmap: tokio::sync::Mutex::new(FSMap::new_with_root(root_dir)),
+            read_only,
+        }
+    }
+
+    /// Create a new mirror file system with mount points
+    pub fn new_with_mounts(root_dir: PathBuf, read_only: bool, mounts: Vec<config::MountConfig>) -> MirrorFS {
+        // Convert MountConfig to (String, PathBuf, bool) format
+        let mount_tuples: Vec<(String, PathBuf, bool)> = mounts
+            .into_iter()
+            .map(|m| (m.target, m.source, m.read_only))
+            .collect();
+
+        MirrorFS {
+            fsmap: tokio::sync::Mutex::new(FSMap::new_with_mounts(root_dir, mount_tuples)),
             read_only,
         }
     }
 
     /// creates a FS object in a given directory and of a given type
-    /// Updates as much metadata as we can in-place
     async fn create_fs_object(
         &self,
         dirid: fileid3,
         objectname: &filename3,
         object: &CreateFSObject,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        if self.read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
         let mut fsmap = self.fsmap.lock().await;
         let ent = fsmap.find_entry(dirid)?;
-        let mut path = fsmap.sym_to_path(&ent.name).await;
+
+        // Get the real file system path for the directory
+        let (dir_path, dir_read_only) = match fsmap.sym_to_real_path(&ent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point, cannot create objects here
+                return Err(nfsstat3::NFS3ERR_ACCES);
+            }
+        };
+
+        if dir_read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
+        let mut path = dir_path;
         let objectname_osstr = OsStr::from_bytes(objectname).to_os_string();
         path.push(&objectname_osstr);
 
@@ -373,7 +582,30 @@ impl NFSFileSystem for MirrorFS {
         // Optimize for negative lookups.
         // See if the file actually exists on the filesystem
         let dirent = fsmap.find_entry(dirid)?;
-        let mut path = fsmap.sym_to_path(&dirent.name).await;
+
+        // Get the real file system path for the directory
+        let (dir_path, _dir_read_only) = match fsmap.sym_to_real_path(&dirent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point, check if it's the mount point itself
+                if dirent.name.len() == 1 {
+                    let mount_name = fsmap.intern.get(dirent.name[0]).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+                    for (target_path, _source_path, _) in &fsmap.mounts {
+                        if mount_name == OsStr::new(target_path.trim_start_matches('/')) {
+                            // Check if the filename matches this mount point
+                            let filename_str = OsStr::from_bytes(filename);
+                            if filename_str == mount_name {
+                                // This is a lookup for the mount point itself
+                                return Ok(dirid);
+                            }
+                        }
+                    }
+                }
+                return Err(nfsstat3::NFS3ERR_NOENT);
+            }
+        };
+
+        let mut path = dir_path;
         let objectname_osstr = OsStr::from_bytes(filename).to_os_string();
         path.push(&objectname_osstr);
         if !exists_no_traverse(&path) {
@@ -415,7 +647,16 @@ impl NFSFileSystem for MirrorFS {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let fsmap = self.fsmap.lock().await;
         let ent = fsmap.find_entry(id)?;
-        let path = fsmap.sym_to_path(&ent.name).await;
+
+        // Get the real file system path
+        let (path, _read_only) = match fsmap.sym_to_real_path(&ent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point or root, cannot read
+                return Err(nfsstat3::NFS3ERR_ISDIR);
+            }
+        };
+
         drop(fsmap);
         let mut f = File::open(&path).await.or(Err(nfsstat3::NFS3ERR_NOENT))?;
         let len = f.metadata().await.or(Err(nfsstat3::NFS3ERR_NOENT))?.len();
@@ -518,9 +759,25 @@ impl NFSFileSystem for MirrorFS {
         offset: u64,
         data: &[u8],
     ) -> Result<fattr3, nfsstat3> {
+        if self.read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
         let fsmap = self.fsmap.lock().await;
         let ent = fsmap.find_entry(id)?;
-        let path = fsmap.sym_to_path(&ent.name).await;
+
+        // Get the real file system path
+        let (path, read_only) = match fsmap.sym_to_real_path(&ent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point or root, cannot write
+                return Err(nfsstat3::NFS3ERR_ISDIR);
+            }
+        };
+
+        if read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
         drop(fsmap);
         debug!("write to init {:?}", path);
         let mut f = OpenOptions::new()
@@ -577,10 +834,29 @@ impl NFSFileSystem for MirrorFS {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        if self.read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
         let mut fsmap = self.fsmap.lock().await;
         let ent = fsmap.find_entry(dirid)?;
-        let mut path = fsmap.sym_to_path(&ent.name).await;
+
+        // Get the real file system path for the directory
+        let (dir_path, dir_read_only) = match fsmap.sym_to_real_path(&ent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point, cannot remove objects here
+                return Err(nfsstat3::NFS3ERR_ACCES);
+            }
+        };
+
+        if dir_read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
+        let mut path = dir_path;
         path.push(OsStr::from_bytes(filename));
+
         if let Ok(meta) = path.symlink_metadata() {
             if meta.is_dir() {
                 tokio::fs::remove_dir(&path)
@@ -627,14 +903,38 @@ impl NFSFileSystem for MirrorFS {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        if self.read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
         let mut fsmap = self.fsmap.lock().await;
 
         let from_dirent = fsmap.find_entry(from_dirid)?;
-        let mut from_path = fsmap.sym_to_path(&from_dirent.name).await;
-        from_path.push(OsStr::from_bytes(from_filename));
+        let (from_dir_path, from_read_only) = match fsmap.sym_to_real_path(&from_dirent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point, cannot rename from here
+                return Err(nfsstat3::NFS3ERR_ACCES);
+            }
+        };
 
         let to_dirent = fsmap.find_entry(to_dirid)?;
-        let mut to_path = fsmap.sym_to_path(&to_dirent.name).await;
+        let (to_dir_path, to_read_only) = match fsmap.sym_to_real_path(&to_dirent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point, cannot rename to here
+                return Err(nfsstat3::NFS3ERR_ACCES);
+            }
+        };
+
+        if from_read_only || to_read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
+        let mut from_path = from_dir_path;
+        from_path.push(OsStr::from_bytes(from_filename));
+
+        let mut to_path = to_dir_path;
         // to folder must exist
         if !exists_no_traverse(&to_path) {
             return Err(nfsstat3::NFS3ERR_NOENT);
@@ -720,7 +1020,16 @@ impl NFSFileSystem for MirrorFS {
     async fn readlink(&self, _auth: &AuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
         let fsmap = self.fsmap.lock().await;
         let ent = fsmap.find_entry(id)?;
-        let path = fsmap.sym_to_path(&ent.name).await;
+
+        // Get the real file system path
+        let (path, _read_only) = match fsmap.sym_to_real_path(&ent.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point or root, cannot readlink
+                return Err(nfsstat3::NFS3ERR_BADTYPE);
+            }
+        };
+
         drop(fsmap);
         if path.is_symlink() {
             if let Ok(target) = path.read_link() {
@@ -770,15 +1079,37 @@ impl NFSFileSystem for MirrorFS {
         linkdirid: fileid3,
         linkname: &filename3,
     ) -> Result<(), nfsstat3> {
+        if self.read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
         let mut fsmap = self.fsmap.lock().await;
 
         // Get the file path
         let file_entry = fsmap.find_entry(fileid)?;
-        let file_path = fsmap.sym_to_path(&file_entry.name).await;
+        let (file_path, _file_read_only) = match fsmap.sym_to_real_path(&file_entry.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point or root, cannot link
+                return Err(nfsstat3::NFS3ERR_ACCES);
+            }
+        };
 
         // Get the link directory path
         let linkdir_entry = fsmap.find_entry(linkdirid)?;
-        let mut link_path = fsmap.sym_to_path(&linkdir_entry.name).await;
+        let (link_dir_path, link_read_only) = match fsmap.sym_to_real_path(&linkdir_entry.name).await {
+            Some(path) => path,
+            None => {
+                // This is a mount point, cannot create link here
+                return Err(nfsstat3::NFS3ERR_ACCES);
+            }
+        };
+
+        if link_read_only {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+
+        let mut link_path = link_dir_path;
         link_path.push(OsStr::from_bytes(linkname));
 
         // Create the hard link
@@ -821,9 +1152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let cli = Cli::parse();
 
-    // Validate configuration
-    cli.validate()?;
-
     // Initialize logging
     let subscriber = FmtSubscriber::builder()
         .with_max_level(cli.get_log_level())
@@ -831,26 +1159,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
+    // Load configuration
+    let config = cli.load_config()?;
+
     // Handle daemon mode
-    if cli.daemon {
+    if config.server.daemon {
         handle_daemon_mode(&cli)?;
     }
 
     // Change working directory if specified
-    change_working_directory(&cli.work_dir)?;
+    change_working_directory(&config.server.work_dir)?;
 
     // Parse allowed IP addresses
     let allowed_ips = cli.parse_allowed_ips();
 
     // Print startup information
-    cli.print_startup_info(&allowed_ips);
+    Cli::print_startup_info(&config, &allowed_ips);
 
-    // Create NFS file system
-    let root_dir = cli.directory.canonicalize()?;
-    let fs = MirrorFS::new(root_dir, cli.read_only);
+    // Create NFS file system - use the first mount's source as root directory
+    let root_dir = if !config.mounts.is_empty() {
+        config.mounts[0].source.canonicalize()?
+    } else {
+        return Err("No mount points configured".into());
+    };
+
+    let fs = MirrorFS::new_with_mounts(root_dir, config.server.read_only, config.mounts);
 
     // Start NFS TCP server
-    let addr = format!("{}:{}", cli.ip, cli.port).parse()?;
+    let addr = format!("{}:{}", config.server.ip, config.server.port).parse()?;
     let listener = NFSTcpListener::bind(addr, fs).await?;
 
     // Start the server

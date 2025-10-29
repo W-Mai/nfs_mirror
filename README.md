@@ -13,35 +13,94 @@ services.
 - 🔄 Daemon mode support
 - 🎯 IP access control
 - ⚡ Timeout configuration
+- 🔌 Multi-mount point configuration
+- 📁 Single directory and multi-directory modes
+- 🔐 Read/write permission control (global and per-mount point)
+- 📝 TOML configuration file support
+- 🎮 Dynamic mount point management
 
 ## Installation
 
 ```bash
+# Clone project
+git clone <repository-url>
+cd nfs_mirror
+
+# Build release version
+cargo build --release
+
+# Binary location
+./target/release/nfs_mirror
+
+# Install via Cargo
 cargo install --path .
 ```
 
 ## Usage
 
-### Basic Usage
+### 1. Single Directory Mode
 
 ```bash
-# Start NFS mirror service
-nfs_mirror /path/to/directory
+# Basic usage
+nfs_mirror /path/to/directory -t /mount_point
+
+# With verbose logging
+nfs_mirror /path/to/directory -t /mount_point -v
+
+# Read-only mode
+nfs_mirror /path/to/directory -t /mount_point --read-only
 
 # Specify IP and port
-nfs_mirror /path/to/directory --ip 0.0.0.0 --port 2049
+nfs_mirror /path/to/directory --ip 0.0.0.0 --port 11451
 
 # Enable verbose output
 nfs_mirror /path/to/directory --verbose
 ```
 
-### Advanced Configuration
+### 2. Configuration File Mode
+
+Create configuration file `config.toml`:
+
+```toml
+[server]
+ip = "127.0.0.1"
+port = 11451
+log_level = "info"
+verbose = true
+read_only = false
+
+[[mounts]]
+source = "/Users/w-mai/Projects/Rust/nfs_mirror/src"
+target = "/source"
+read_only = false
+description = "Source code directory"
+
+[[mounts]]
+source = "/tmp"
+target = "/temp"
+read_only = false
+description = "Temporary files directory"
+```
+
+Start service:
+
+```bash
+nfs_mirror -c config.toml
+```
+
+### 3. Generate Example Configuration File
+
+```bash
+nfs_mirror --generate-config example.toml
+```
+
+### 4. Advanced Configuration
 
 ```bash
 # Complete configuration example
 nfs_mirror /path/to/directory \
     --ip 192.168.1.100 \
-    --port 2049 \
+    --port 11451 \
     --log-level info \
     --verbose \
     --max-connections 200 \
@@ -51,7 +110,7 @@ nfs_mirror /path/to/directory \
     --allow-ips "192.168.1.0/24,10.0.0.100"
 ```
 
-### Daemon Mode
+### 5. Daemon Mode
 
 ```bash
 # Run in background
@@ -88,6 +147,8 @@ nfs_mirror /path/to/directory --daemon --work-dir /var/lib/nfs_mirror
 - `--read-only`: Enable read-only mode
 - `--pid-file <PID_FILE>`: PID file path (used in daemon mode)
 - `--work-dir <WORK_DIR>`: Working directory
+- `-c, --config <CONFIG>`: Configuration file path
+- `--generate-config <GENERATE_CONFIG>`: Generate example configuration file
 
 #### Performance Configuration
 
@@ -128,6 +189,15 @@ sudo mount -t nfs -o resvport,nolocks,vers=3,tcp,port=11451,mountport=11451 127.
 sudo umount /mnt/nfs
 ```
 
+### Mount Options Explanation
+
+- `nolocks`: Disable file locks (recommended for local testing)
+- `vers=3`: Use NFSv3 protocol
+- `tcp`: Use TCP protocol
+- `port=11451`: NFS port
+- `mountport=11451`: Mount port
+- `soft`: Soft mount (returns error after timeout)
+
 ## Configuration Examples
 
 ### Development Environment
@@ -148,7 +218,7 @@ nfs_mirror /data/shared \
     --pid-file /var/run/nfs_mirror.pid \
     --work-dir /var/lib/nfs_mirror \
     --ip 0.0.0.0 \
-    --port 2049 \
+    --port 11451 \
     --log-level warn \
     --max-connections 500 \
     --read-timeout 120 \
@@ -162,33 +232,90 @@ nfs_mirror /data/shared \
 nfs_mirror /public/files \
     --read-only \
     --ip 0.0.0.0 \
-    --port 2049 \
+    --port 11451 \
     --max-connections 1000
 ```
 
+## Logs and Monitoring
+
+### Log Levels
+
+- `error`: Error messages only
+- `warn`: Warnings and errors
+- `info`: General information (recommended)
+- `debug`: Debug information
+- `trace`: Detailed trace information
+
+### Example Log Output
+
+```
+INFO  nfs_mirror::cli: NFS Mirror service starting...
+INFO  nfs_mirror::cli: Listen address: 127.0.0.1:11451
+INFO  nfs_mirror::cli: Configured mount points:
+INFO  nfs_mirror::cli:   1: /Users/w-mai/Projects/Rust/nfs_mirror/src -> /source (read-only: No)
+INFO  nfs_mirror::cli: NFS service started, waiting for client connections...
+INFO  zerofs_nfsserve::tcp: Listening on 127.0.0.1:11451
+```
+
+## Error Handling
+
+The program validates configuration and provides detailed error messages:
+
+- Configuration file syntax errors
+- IP address format errors
+- Source directory does not exist
+- Duplicate target paths
+- Port configuration errors
+
+## Performance Optimization
+
+1. **Use appropriate log levels**: Production environments recommend `info` or `warn`
+2. **Adjust timeout settings**: Adjust read/write timeouts based on network environment
+3. **Connection limits**: Adjust maximum connections based on server performance
+4. **Memory usage**: Large directories recommend increasing system memory
+
 ## Security Considerations
 
-1. **Network Access**: Use `--allow-ips` to restrict client access
-2. **Read-only Mode**: Enable `--read-only` for scenarios that don't require writing
+1. **Access Control**: Use `allow_ips` to restrict client IP access
+2. **Read-only Mode**: Enable read-only mode for sensitive data
 3. **Firewall**: Ensure firewall rules are properly configured
-4. **Permissions**: Ensure the mirrored directory permissions are set correctly
+4. **User Permissions**: Ensure the mirrored directory permissions are set correctly
+5. **Run as non-privileged user**: Run the service with minimal privileges
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Mount Failure**
+    - Check network connection
+    - Verify port is not occupied
+    - Confirm firewall settings
+
+2. **Permission Errors**
+    - Check source directory permissions
+    - Verify NFS client permissions
+
+3. **Performance Issues**
+    - Adjust timeout settings
+    - Check network latency
+    - Monitor system resources
+
+### Debug Commands
+
+```bash
+# Enable verbose logging
+nfs_mirror -c config.toml -l debug -v
+
+# Check port usage
+netstat -an | grep 11451
+
+# Test with single directory
+nfs_mirror /path/to/directory -t /mount_point -v
+```
 
 ## Testing
 
-The project includes a comprehensive test script to verify NFS server functionality:
-
-```bash
-# Run the test script
-./test_nfs.sh
-```
-
-The test script will:
-
-1. Create a test directory with sample files
-2. Start the NFS server in background
-3. Attempt to mount the NFS share (requires appropriate permissions)
-4. Verify file access and functionality
-5. Clean up test environment
+The project includes comprehensive test functionality:
 
 ### Manual Testing
 
@@ -198,61 +325,20 @@ mkdir -p /tmp/nfs_test
 echo "Hello NFS" > /tmp/nfs_test/test.txt
 
 # Start server (in one terminal)
-cargo run -- /tmp/nfs_test --port 12000 --verbose
+nfs_mirror /tmp/nfs_test -t /test -v
 
-# Test mount (in another terminal, may require sudo)
-mkdir -p /tmp/nfs_mount
-mount -t nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000,soft 127.0.0.1:/ /tmp/nfs_mount
+# Mount in another terminal
+sudo mkdir -p /mnt/nfs_test
+sudo mount -t nfs -o nolocks,vers=3,tcp,port=11451,mountport=11451,soft 127.0.0.1:/test /mnt/nfs_test
 
-# Verify files
-ls -la /tmp/nfs_mount
-cat /tmp/nfs_mount/test.txt
+# Test file access
+ls -la /mnt/nfs_test/
+cat /mnt/nfs_test/test.txt
 
 # Cleanup
-umount /tmp/nfs_mount
+sudo umount /mnt/nfs_test
 ```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Port Occupied**: Change the port number or stop the process occupying the port
-2. **Insufficient Permissions**: Ensure you have read permissions for the mirrored directory
-3. **Network Connection**: Check firewall and network configuration
-4. **Mount Failure**: Ensure NFS client is installed and properly configured
-5. **macOS NFS Issues**: On macOS, you may need to use `resvport` option and ensure NFS client is enabled
-
-### Debug Mode
-
-```bash
-# Enable verbose logging for debugging
-nfs_mirror /path/to/directory --verbose --log-level debug
-```
-
-### Log Analysis
-
-The server provides detailed logging when `--verbose` is enabled:
-
-- Connection status and client information
-- File system operations
-- Performance metrics
-- Error conditions
-
-## Performance Considerations
-
-- **Async I/O**: The server uses Tokio for high-performance asynchronous I/O
-- **Connection Pooling**: Configurable maximum connections to balance performance and resource usage
-- **Timeout Configuration**: Adjustable read/write timeouts for different network conditions
-- **Memory Efficiency**: Symbol table for efficient path handling
 
 ## License
 
-This project is licensed under [LICENSE](LICENSE).
-
-## Contributing
-
-Issues and Pull Requests are welcome!
-
-## Author
-
-Benign X <1341398182@qq.com>
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

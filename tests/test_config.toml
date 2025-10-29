@@ -1,0 +1,12 @@
+[server]
+ip = "127.0.0.1"
+port = 11451
+log_level = "info"
+verbose = true
+read_only = false
+
+[[mounts]]
+source = "/Users/w-mai/Projects/Rust/nfs_mirror"
+target = "/test"
+read_only = false
+description = "Test mount point"

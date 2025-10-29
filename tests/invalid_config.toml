@@ -1,0 +1,9 @@
+[server]
+ip = "invalid_ip"
+port = 11451
+log_level = "info"
+
+[[mounts]]
+source = "/nonexistent/path"
+target = "/test"
+read_only = false

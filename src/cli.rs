@@ -3,16 +3,34 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use tracing::info;
 
-/// NFS Mirror - Mirror a local directory into an NFS shared service
+use crate::config::{Config, MountConfig, ServerConfig};
+
+/// NFS Mirror - Mirror local directories into an NFS shared service
 #[derive(Parser)]
 #[command(name = "nfs_mirror")]
-#[command(about = "Mirror a local directory into an NFS shared service.")]
+#[command(about = "Mirror local directories into an NFS shared service.")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(author = "Benign X <1341398182@qq.com>")]
 pub struct Cli {
-    /// Local directory path to mirror
-    #[arg(help = "Local directory path to mirror")]
-    pub directory: PathBuf,
+    /// Configuration file path (TOML format)
+    #[arg(
+        short = 'c',
+        long = "config",
+        help = "Configuration file path (TOML format)"
+    )]
+    pub config: Option<PathBuf>,
+
+    /// Local directory path to mirror (for single directory mode)
+    #[arg(help = "Local directory path to mirror (use with --target for single directory mode)")]
+    pub directory: Option<PathBuf>,
+
+    /// Target mount path (for single directory mode)
+    #[arg(
+        short = 't',
+        long = "target",
+        help = "Target mount path (for single directory mode)"
+    )]
+    pub target: Option<String>,
 
     /// Listen IP address
     #[arg(
@@ -96,6 +114,13 @@ pub struct Cli {
     /// Disable log colors
     #[arg(long = "no-color", help = "Disable log colors")]
     pub no_color: bool,
+
+    /// Generate a sample configuration file
+    #[arg(
+        long = "generate-config",
+        help = "Generate a sample configuration file and exit"
+    )]
+    pub generate_config: Option<PathBuf>,
 }
 
 impl Cli {
@@ -127,55 +152,231 @@ impl Cli {
         }
     }
 
-    /// Validate the configuration
-    pub fn validate(&self) -> Result<(), String> {
-        // Check if directory exists
-        if !self.directory.exists() {
-            return Err(format!(
-                "Directory '{}' does not exist",
-                self.directory.display()
-            ));
+    /// Create configuration from CLI arguments
+    pub fn to_config(&self) -> Result<Config, String> {
+        // Check if we're in single directory mode
+        let is_single_mode = self.directory.is_some();
+
+        if is_single_mode {
+            // Single directory mode
+            let directory = self.directory.as_ref().ok_or("Directory is required")?;
+            let target = self
+                .target
+                .as_ref()
+                .ok_or("Target path is required for single directory mode")?;
+
+            let mount = MountConfig {
+                source: directory.clone(),
+                target: target.clone(),
+                read_only: self.read_only,
+                description: Some(format!("Mount from {} to {}", directory.display(), target)),
+            };
+
+            Ok(Config {
+                server: ServerConfig {
+                    ip: self.ip,
+                    port: self.port,
+                    log_level: self.log_level.clone(),
+                    verbose: self.verbose,
+                    daemon: self.daemon,
+                    pid_file: self.pid_file.clone(),
+                    work_dir: self.work_dir.clone(),
+                    max_connections: self.max_connections,
+                    read_timeout: self.read_timeout,
+                    write_timeout: self.write_timeout,
+                    read_only: self.read_only,
+                    allow_ips: self.allow_ips.clone(),
+                    no_color: self.no_color,
+                },
+                mounts: vec![mount],
+            })
+        } else {
+            // Config file mode
+            Err("Config file mode not implemented yet".to_string())
+        }
+    }
+
+    /// Load configuration from file or create from CLI arguments
+    pub fn load_config(&self) -> Result<Config, String> {
+        // If generate config is requested, create and save a sample config
+        if let Some(ref config_path) = self.generate_config {
+            let sample_config = Self::create_sample_config();
+            sample_config.to_file(config_path).map_err(|e| {
+                format!(
+                    "Failed to write sample configuration to '{}': {}",
+                    config_path.display(),
+                    e
+                )
+            })?;
+            info!(
+                "Sample configuration file written to: {}",
+                config_path.display()
+            );
+            std::process::exit(0);
         }
 
-        if !self.directory.is_dir() {
-            return Err(format!("'{}' is not a directory", self.directory.display()));
+        // Load from config file if specified
+        if let Some(ref config_path) = self.config {
+            let mut config = Config::from_file(config_path).map_err(|e| {
+                format!(
+                    "Failed to load configuration from '{}': {}",
+                    config_path.display(),
+                    e
+                )
+            })?;
+
+            // Override config file settings with CLI arguments
+            self.override_config(&mut config);
+
+            // Validate the configuration
+            config.validate()?;
+            return Ok(config);
         }
 
-        // Validate port range
-        if self.port == 0 {
-            return Err("Port cannot be 0".to_string());
+        // Check if we're in single directory mode
+        if self.directory.is_some() {
+            let config = self.to_config()?;
+            config.validate()?;
+            return Ok(config);
         }
 
-        Ok(())
+        Err("Either --config file or --directory with --target must be specified".to_string())
+    }
+
+    /// Override configuration file settings with CLI arguments
+    fn override_config(&self, config: &mut Config) {
+        // Override server settings if provided via CLI
+        if self.ip.to_string() != "127.0.0.1" {
+            config.server.ip = self.ip;
+        }
+        if self.port != 11451 {
+            config.server.port = self.port;
+        }
+        if self.log_level != "error" {
+            config.server.log_level = self.log_level.clone();
+        }
+        if self.verbose {
+            config.server.verbose = self.verbose;
+        }
+        if self.daemon {
+            config.server.daemon = self.daemon;
+        }
+        if self.pid_file.is_some() {
+            config.server.pid_file = self.pid_file.clone();
+        }
+        if self.work_dir.is_some() {
+            config.server.work_dir = self.work_dir.clone();
+        }
+        if self.max_connections != 100 {
+            config.server.max_connections = self.max_connections;
+        }
+        if self.read_timeout != 30 {
+            config.server.read_timeout = self.read_timeout;
+        }
+        if self.write_timeout != 30 {
+            config.server.write_timeout = self.write_timeout;
+        }
+        if self.read_only {
+            config.server.read_only = self.read_only;
+        }
+        if self.allow_ips.is_some() {
+            config.server.allow_ips = self.allow_ips.clone();
+        }
+        if self.no_color {
+            config.server.no_color = self.no_color;
+        }
+    }
+
+    /// Create a sample configuration
+    fn create_sample_config() -> Config {
+        Config {
+            server: ServerConfig {
+                ip: "127.0.0.1".parse().unwrap(),
+                port: 11451,
+                log_level: "info".to_string(),
+                verbose: false,
+                daemon: false,
+                pid_file: None,
+                work_dir: None,
+                max_connections: 100,
+                read_timeout: 30,
+                write_timeout: 30,
+                read_only: false,
+                allow_ips: None,
+                no_color: false,
+            },
+            mounts: vec![
+                MountConfig {
+                    source: PathBuf::from("/Users/aaaa"),
+                    target: "/bbbb".to_string(),
+                    read_only: false,
+                    description: Some("Example mount: maps /Users/aaaa to /bbbb".to_string()),
+                },
+                MountConfig {
+                    source: PathBuf::from("/tmp/shared"),
+                    target: "/shared".to_string(),
+                    read_only: true,
+                    description: Some("Read-only shared directory".to_string()),
+                },
+            ],
+        }
     }
 
     /// Print startup information using log system
-    pub fn print_startup_info(&self, allowed_ips: &[IpAddr]) {
+    pub fn print_startup_info(config: &Config, allowed_ips: &[IpAddr]) {
         info!("NFS Mirror service starting...");
-        info!("Mirror directory: {}", self.directory.display());
-        info!("Listen address: {}:{}", self.ip, self.port);
-        info!("Log level: {}", self.log_level);
-        info!("Max connections: {}", self.max_connections);
-        info!("Read timeout: {} seconds", self.read_timeout);
-        info!("Write timeout: {} seconds", self.write_timeout);
         info!(
-            "Read-only mode: {}",
-            if self.read_only { "Yes" } else { "No" }
+            "Listen address: {}:{}",
+            config.server.ip, config.server.port
+        );
+        info!("Log level: {}", config.server.log_level);
+        info!("Max connections: {}", config.server.max_connections);
+        info!("Read timeout: {} seconds", config.server.read_timeout);
+        info!("Write timeout: {} seconds", config.server.write_timeout);
+        info!(
+            "Global read-only mode: {}",
+            if config.server.read_only { "Yes" } else { "No" }
         );
 
         if !allowed_ips.is_empty() {
             info!("Allowed IP addresses: {:?}", allowed_ips);
         }
 
-        if self.daemon {
+        if config.server.daemon {
             info!("Daemon mode: Enabled");
         }
 
+        info!("Configured mount points:");
+        for (i, mount) in config.mounts.iter().enumerate() {
+            info!(
+                "  {}: {} -> {} (read-only: {}){}",
+                i + 1,
+                mount.source.display(),
+                mount.target,
+                if mount.read_only || config.server.read_only {
+                    "Yes"
+                } else {
+                    "No"
+                },
+                mount
+                    .description
+                    .as_ref()
+                    .map(|d| format!(" - {}", d))
+                    .unwrap_or_default()
+            );
+        }
+
         info!("NFS service started, waiting for client connections...");
-        info!("Mount command example:");
-        info!(
-            "mount -t nfs -o nolocks,vers=3,tcp,port={},mountport={},soft {}:/ /mnt/nfs/",
-            self.port, self.port, self.ip
-        );
+        info!("Mount command examples:");
+        for mount in &config.mounts {
+            info!(
+                "mount -t nfs -o nolocks,vers=3,tcp,port={},mountport={},soft {}:{} /mnt{}",
+                config.server.port,
+                config.server.port,
+                config.server.ip,
+                mount.target,
+                mount.target
+            );
+        }
     }
 }

@@ -17,7 +17,7 @@ pub fn handle_daemon_mode(cli: &Cli) -> Result<(), String> {
                 if unsafe { libc::setsid() } == -1 {
                     return Err("Failed to create new session".to_string());
                 }
-                
+
                 match unsafe { libc::fork() } {
                     -1 => {
                         return Err("Failed to create second child process".to_string());
@@ -28,7 +28,7 @@ pub fn handle_daemon_mode(cli: &Cli) -> Result<(), String> {
                             eprintln!("Failed to setup daemon stdio: {}", e);
                             std::process::exit(1);
                         }
-                        
+
                         // Write PID file
                         if let Some(pid_file) = &cli.pid_file {
                             if let Err(e) = write_pid_file(pid_file) {
@@ -49,12 +49,12 @@ pub fn handle_daemon_mode(cli: &Cli) -> Result<(), String> {
             }
         }
     }
-    
+
     #[cfg(not(unix))]
     {
         return Err("Daemon mode is only supported on Unix systems".to_string());
     }
-    
+
     Ok(())
 }
 
@@ -62,14 +62,14 @@ pub fn handle_daemon_mode(cli: &Cli) -> Result<(), String> {
 #[cfg(unix)]
 fn setup_daemon_stdio() -> Result<(), String> {
     use std::os::fd::AsRawFd;
-    
+
     // Redirect standard input/output to /dev/null
     let _ = File::create("/dev/null").map(|f| unsafe {
         let _ = libc::dup2(f.as_raw_fd(), libc::STDIN_FILENO);
         let _ = libc::dup2(f.as_raw_fd(), libc::STDOUT_FILENO);
         let _ = libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO);
     });
-    
+
     Ok(())
 }
 
@@ -77,10 +77,10 @@ fn setup_daemon_stdio() -> Result<(), String> {
 fn write_pid_file(pid_file: &PathBuf) -> Result<(), String> {
     let mut file = File::create(pid_file)
         .map_err(|e| format!("Failed to create PID file '{}': {}", pid_file.display(), e))?;
-    
+
     writeln!(file, "{}", std::process::id())
         .map_err(|e| format!("Failed to write to PID file '{}': {}", pid_file.display(), e))?;
-    
+
     Ok(())
 }
 

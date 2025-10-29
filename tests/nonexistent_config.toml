@@ -1,0 +1,11 @@
+[server]
+ip = "127.0.0.1"
+port = 11451
+log_level = "info"
+verbose = true
+
+[[mounts]]
+source = "/nonexistent/directory/path"
+target = "/test"
+read_only = false
+description = "Nonexistent directory"

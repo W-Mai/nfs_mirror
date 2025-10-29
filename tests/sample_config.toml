@@ -1,0 +1,23 @@
+[server]
+ip = "127.0.0.1"
+port = 11451
+log_level = "info"
+verbose = false
+daemon = false
+max_connections = 100
+read_timeout = 30
+write_timeout = 30
+read_only = false
+no_color = false
+
+[[mounts]]
+source = "/Users/aaaa"
+target = "/bbbb"
+read_only = false
+description = "Example mount: maps /Users/aaaa to /bbbb"
+
+[[mounts]]
+source = "/tmp/shared"
+target = "/shared"
+read_only = true
+description = "Read-only shared directory"
