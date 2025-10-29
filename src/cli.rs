@@ -289,37 +289,22 @@ impl Cli {
 
     /// Create a sample configuration
     fn create_sample_config() -> Config {
-        Config {
-            server: ServerConfig {
-                ip: "127.0.0.1".parse().unwrap(),
-                port: 11451,
-                log_level: "info".to_string(),
-                verbose: false,
-                daemon: false,
-                pid_file: None,
-                work_dir: None,
-                max_connections: 100,
-                read_timeout: 30,
-                write_timeout: 30,
+        let mut config = Config::default();
+        config.mounts = vec![
+            MountConfig {
+                source: PathBuf::from("/Users/aaaa"),
+                target: "/bbbb".to_string(),
                 read_only: false,
-                allow_ips: None,
-                no_color: false,
+                description: Some("Example mount: maps /Users/aaaa to /bbbb".to_string()),
             },
-            mounts: vec![
-                MountConfig {
-                    source: PathBuf::from("/Users/aaaa"),
-                    target: "/bbbb".to_string(),
-                    read_only: false,
-                    description: Some("Example mount: maps /Users/aaaa to /bbbb".to_string()),
-                },
-                MountConfig {
-                    source: PathBuf::from("/tmp/shared"),
-                    target: "/shared".to_string(),
-                    read_only: true,
-                    description: Some("Read-only shared directory".to_string()),
-                },
-            ],
-        }
+            MountConfig {
+                source: PathBuf::from("/tmp/shared"),
+                target: "/shared".to_string(),
+                read_only: true,
+                description: Some("Read-only shared directory".to_string()),
+            },
+        ];
+        config
     }
 
     /// Print startup information using log system

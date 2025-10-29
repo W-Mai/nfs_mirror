@@ -111,6 +111,7 @@ fn default_write_timeout() -> u64 {
     30
 }
 
+#[allow(unused)]
 impl Config {
     /// Load configuration from a TOML file
     pub fn from_file<P: AsRef<std::path::Path>>(
