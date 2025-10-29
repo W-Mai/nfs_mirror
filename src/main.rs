@@ -6,7 +6,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::io::SeekFrom;
-use std::net::IpAddr;
 use std::ops::Bound;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
